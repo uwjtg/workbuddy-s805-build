@@ -1,0 +1,319 @@
+name: Build S805 armv7 upstream
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 云编译仓库：定时检查官方 Release，只在「上游 Go 源码变了」时交叉编译。
+# 产出物发布到本仓库的 Release，S805 盒子匿名拉取，不需要 token / 入站端口。
+#
+# 判据：官方发布包内 upstream/.upstream-id（项目官方 update.py 也用它）
+#   id 未变 → 复用上一次的 s805-bin.tar.gz，跳过 go build
+#   id 变了 → GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 编 6 个静态二进制
+#
+# 产物契约见 README.md：固定 URL 是 releases/latest/download/manifest.json
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    # 避开整点（GitHub 官方文档：整点是 Actions 高负载时段，任务可能被延迟或丢弃）
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '指定官方版本 tag（留空 = 最新 Release）'
+        type: string
+        default: ''
+      force:
+        description: '已发布过该版本也强制重建'
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-armv7.yml']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: s805-armv7-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: ithtelab/workbuddy-manager
+  GOARM: '7'
+  BINARIES: 'wb2api signin_bin login credit trial_bin activity_bin'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 1. 查询官方最新版本
+        id: up
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WANT_TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -n "${WANT_TAG:-}" ]; then
+            TAG="$WANT_TAG"
+          else
+            # runner 走 GitHub 内网 + 认证额度，不受家用出口 IP 的匿名限流影响
+            TAG="$(gh api "repos/$UPSTREAM_REPO/releases/latest" --jq .tag_name)"
+          fi
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
+            echo "::error::版本号格式异常：$TAG"; exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "官方最新版本：$TAG"
+
+      - name: 2. 已发布过则跳过
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.up.outputs.tag }}
+          FORCE: ${{ inputs.force }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "${FORCE:-false}" = "true" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"; echo "force=true" >> "$GITHUB_OUTPUT"
+            echo "强制重建"; exit 0
+          fi
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "$TAG 已发布过，跳过（可用 workflow_dispatch + force 重建）"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "force=false" >> "$GITHUB_OUTPUT"
+
+      - name: 3. 下载官方发布包并读取 upstream-id
+        if: steps.gate.outputs.build == 'true'
+        id: src
+        env:
+          TAG: ${{ steps.up.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          PKG="workbuddy-manager-$TAG.tar.gz"
+          URL="https://github.com/$UPSTREAM_REPO/releases/download/$TAG/$PKG"
+          echo "下载 $URL"
+          curl -fL --retry 4 --retry-delay 5 --connect-timeout 20 --max-time 600 -o "$PKG" "$URL"
+          # 完整性：必须是 gzip tar，且顶层是单一目录
+          # 先把完整清单落盘再取首行：直接 `tar | head -1` 会让 tar 收到 SIGPIPE，
+          # 在 set -o pipefail 下整条流水线被判失败（清单超过管道缓冲时必现）。
+          tar -tzf "$PKG" > /tmp/pkg-list.txt
+          TOP="$(head -1 /tmp/pkg-list.txt | cut -d/ -f1)"
+          [ -n "$TOP" ] || { echo "::error::发布包结构异常"; exit 1; }
+          [ "$(cut -d/ -f1 /tmp/pkg-list.txt | sort -u | wc -l)" -eq 1 ] || {
+            echo "::error::发布包存在多个顶层目录，--strip-components=1 会混目录"; exit 1
+          }
+          mkdir -p src
+          tar -xzf "$PKG" -C src --strip-components=1
+          test -f src/upstream/go.mod
+          test -f src/upstream/.upstream-id
+          test -f src/upstream/LICENSE
+          UPID="$(tr -d '[:space:]' < src/upstream/.upstream-id)"
+          [ -n "$UPID" ] || { echo "::error::upstream-id 为空"; exit 1; }
+          echo "upstream_id=$UPID" >> "$GITHUB_OUTPUT"
+          echo "package_sha256=$(sha256sum "$PKG" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "package_name=$PKG" >> "$GITHUB_OUTPUT"
+          echo "上游源码 id：$UPID"
+
+      - name: 4. 判断是否需要重新编译
+        if: steps.gate.outputs.build == 'true'
+        id: decide
+        env:
+          UPID: ${{ steps.src.outputs.upstream_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          BASE="https://github.com/$REPO/releases/latest/download"
+          PREV_ID=""
+          if curl -fsSL --connect-timeout 15 --max-time 60 "$BASE/manifest.json" -o /tmp/prev-manifest.json; then
+            PREV_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("upstream_id",""))' /tmp/prev-manifest.json || true)"
+            if [ -n "$PREV_ID" ] && curl -fsSL --connect-timeout 15 --max-time 300 "$BASE/s805-bin.tar.gz" -o /tmp/prev-bin.tar.gz; then
+              echo "上一版产物已取回"
+            else
+              PREV_ID=""
+            fi
+          fi
+          if [ -n "$PREV_ID" ] && [ "$PREV_ID" = "$UPID" ] && [ -s /tmp/prev-bin.tar.gz ]; then
+            echo "rebuild=false" >> "$GITHUB_OUTPUT"
+            echo "✅ upstream-id 未变 → 不重新编译，复用上一版二进制"
+          else
+            echo "rebuild=true" >> "$GITHUB_OUTPUT"
+            echo "⚠️ upstream-id 变化或首次构建 → 需要交叉编译（prev=${PREV_ID:-none}）"
+          fi
+
+      - name: 5. 准备 Go（仅需要重编译时）
+        if: steps.gate.outputs.build == 'true' && steps.decide.outputs.rebuild == 'true'
+        uses: actions/setup-go@v5
+        with:
+          # go.mod 要求 go 1.22.5；钉死版本保证产物可复现
+          go-version: '1.22.5'
+          cache-dependency-path: src/upstream/go.sum
+
+      - name: 6. 交叉编译 6 个 armv7 静态二进制
+        if: steps.gate.outputs.build == 'true' && steps.decide.outputs.rebuild == 'true'
+        env:
+          TAG: ${{ steps.up.outputs.tag }}
+          UPID: ${{ steps.src.outputs.upstream_id }}
+          RUN_ID: ${{ github.run_id }}
+          OUT_DIR: ${{ github.workspace }}/out
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT_DIR"
+          cd src/upstream
+          export CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM="${GOARM}"
+          # 与 build-s805-bin.ps1 的目标映射保持一致
+          for spec in server:wb2api signin:signin_bin login:login credit:credit trial:trial_bin activity:activity_bin; do
+            cmd="${spec%%:*}"; bin="${spec##*:}"
+            echo "  ./cmd/$cmd -> $bin"
+            go build -trimpath -ldflags '-s -w' -o "$OUT_DIR/$bin" "./cmd/$cmd"
+          done
+          cat > "$OUT_DIR/BUILD-INFO.txt" <<EOF
+          package_version=$TAG
+          upstream_id=$UPID
+          goarm=$GOARM
+          go_version=$(go version)
+          built_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          builder=github-actions/$RUN_ID
+          source=workbuddy-manager release upstream/ (GOOS=linux GOARCH=arm CGO_ENABLED=0)
+          EOF
+          # MIT：再分发二进制必须随附许可证与版权声明
+          cp LICENSE "$OUT_DIR/LICENSE-upstream.txt"
+          cd "$OUT_DIR"
+          # 逐个读 ELF 头，确认是 32 位 ARM 且静态（无 PT_INTERP）
+          python3 - <<'PY'
+          import struct, sys
+          for n in "wb2api signin_bin login credit trial_bin activity_bin".split():
+              b = open(n, 'rb').read()
+              assert b[:4] == b'\x7fELF', f"{n}: not ELF"
+              assert b[4] == 1, f"{n}: not ELF32"
+              assert struct.unpack_from('<H', b, 18)[0] == 40, f"{n}: not EM_ARM"
+              assert b'/lib/ld-' not in b, f"{n}: dynamically linked"
+              print(f"  {n}: ELF32 / EM_ARM / static OK")
+          PY
+          tar -czf "${{ github.workspace }}/s805-bin.tar.gz" \
+            wb2api signin_bin login credit trial_bin activity_bin BUILD-INFO.txt LICENSE-upstream.txt
+          echo "产物：$(du -h "${{ github.workspace }}/s805-bin.tar.gz" | cut -f1)"
+
+      - name: 7. 复用上一版二进制（未重编译时）
+        if: steps.gate.outputs.build == 'true' && steps.decide.outputs.rebuild == 'false'
+        env:
+          TAG: ${{ steps.up.outputs.tag }}
+          WORKSPACE: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORKSPACE/reuse"
+          tar -xzf /tmp/prev-bin.tar.gz -C "$WORKSPACE/reuse"
+          # 上游源码没变，二进制可复用；但自述里的版本号要更新到本次发布包，
+          # 否则盒子端读到的 BUILD-INFO 会显示旧版本，审计时容易误判。
+          python3 - "$TAG" "$WORKSPACE/reuse/BUILD-INFO.txt" <<'PY'
+          import sys
+          tag, path = sys.argv[1], sys.argv[2]
+          lines = [l for l in open(path, encoding='utf-8').read().splitlines()
+                   if not l.startswith('package_version=') and not l.startswith('reused_from=')]
+          old = next((l.split('=', 1)[1] for l in open(path, encoding='utf-8').read().splitlines()
+                      if l.startswith('package_version=')), 'unknown')
+          lines.append('reused_from=%s' % old)
+          lines.insert(0, 'package_version=%s' % tag)
+          open(path, 'w', encoding='utf-8').write('\n'.join(lines) + '\n')
+          print('复用产物：%s -> %s（upstream_id 不变）' % (old, tag))
+          PY
+          ( cd "$WORKSPACE/reuse" && tar -czf "$WORKSPACE/s805-bin.tar.gz" \
+              wb2api signin_bin login credit trial_bin activity_bin BUILD-INFO.txt LICENSE-upstream.txt )
+          echo "产物：$(du -h "$WORKSPACE/s805-bin.tar.gz" | cut -f1)"
+
+      - name: 8. 生成 manifest.json 与校验和
+        if: steps.gate.outputs.build == 'true'
+        id: meta
+        env:
+          TAG: ${{ steps.up.outputs.tag }}
+          UPID: ${{ steps.src.outputs.upstream_id }}
+          REBUILT: ${{ steps.decide.outputs.rebuild }}
+          PKG_NAME: ${{ steps.src.outputs.package_name }}
+          PKG_SHA: ${{ steps.src.outputs.package_sha256 }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 - "$TAG" "$UPID" "$REBUILT" "$PKG_NAME" "$PKG_SHA" "$REPO" <<'PY'
+          import hashlib, json, sys, datetime
+          tag, upid, rebuilt, pkg_name, pkg_sha, repo = sys.argv[1:]
+          def sha(p):
+              h = hashlib.sha256()
+              with open(p, 'rb') as f:
+                  for c in iter(lambda: f.read(1 << 20), b''): h.update(c)
+              return h.hexdigest()
+          base = f"https://github.com/{repo}/releases/download/{tag}"
+          m = {
+            "schema": 1,
+            "package_version": tag,
+            "upstream_id": upid,
+            "rebuilt": rebuilt == 'true',
+            "goarm": "7",
+            "built_at_utc": datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            "builder": "github-actions",
+            "asset_base": base,
+            "assets": {
+              "package": {
+                "name": pkg_name,
+                "sha256": pkg_sha,
+                # 刻意不镜像官方发布包：用官方原地址，避免再分发整个项目
+                "url": f"https://github.com/ithtelab/workbuddy-manager/releases/download/{tag}/{pkg_name}",
+              },
+              "binaries": {
+                "name": "s805-bin.tar.gz",
+                "sha256": sha("s805-bin.tar.gz"),
+                "url": f"{base}/s805-bin.tar.gz",
+              },
+            },
+            "license": "MIT; see LICENSE-upstream.txt inside s805-bin.tar.gz",
+          }
+          with open("manifest.json", "w") as f:
+              json.dump(m, f, indent=2, ensure_ascii=False); f.write("\n")
+          print(json.dumps(m, indent=2, ensure_ascii=False))
+          PY
+          sha256sum s805-bin.tar.gz manifest.json > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: 9. 发布产物 Release
+        if: steps.gate.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.up.outputs.tag }}
+          UPID: ${{ steps.src.outputs.upstream_id }}
+          REBUILT: ${{ steps.decide.outputs.rebuild }}
+          FORCE: ${{ steps.gate.outputs.force }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          # S805 / ARMv7 构建产物 · $TAG
+
+          - 官方版本：\`$TAG\`（源仓库 \`$UPSTREAM_REPO\`）
+          - upstream-id：\`$UPID\`
+          - 本次是否重新编译 Go 上游：\`$REBUILT\`
+          - 目标平台：\`GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0\`，静态 ELF32
+
+          \`s805-bin.tar.gz\` 内为 6 个上游二进制 + BUILD-INFO.txt + LICENSE-upstream.txt。
+          发布包本体请使用 \`manifest.json\` 中 \`assets.package.url\` 指向的官方原地址。
+
+          ## 许可与边界
+
+          上游 workbuddy2api 源码为 MIT（Copyright (c) 2026 Sliverkiss），许可证随二进制包附带。
+          本项目仅用于管理本人及亲属自愿授权的账号，禁止批量注册、账号交易、代注册、
+          绕过平台风控及任何商业转售或盈利性用途；详见源仓库 README 的「使用边界与免责声明」。
+          产物按现状提供，不含任何账号凭据。
+          EOF
+          if [ "$FORCE" = "true" ] && gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" s805-bin.tar.gz manifest.json SHA256SUMS --repo "$REPO" --clobber
+          else
+            gh release create "$TAG" s805-bin.tar.gz manifest.json SHA256SUMS \
+              --repo "$REPO" --title "$TAG (armv7)" --notes-file notes.md
+          fi
+          echo "已发布：https://github.com/$REPO/releases/tag/$TAG"
+          echo "固定清单：https://github.com/$REPO/releases/latest/download/manifest.json"
